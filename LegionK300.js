@@ -2,21 +2,19 @@
 // Reverse-engineered via static analysis (Ghidra/ldm_k300.dll) + live USB capture
 // (USBPcap/Wireshark) of Lenovo "Legion Accessory Central" traffic.
 //
-// Protocol summary (confirmed from live capture):
+// Protocol summary (capture and Lenovo application analysis):
 //   1) USB SET_REPORT Feature control transfer, wValue=0x0300 (ReportId 0,
 //      Type Feature), wIndex=3 (targets the vendor HID interface, MI_03),
 //      wLength=8. Payload: [cmd0, cmd1, 0x5A, 0,0,0,0,0].
 //   2) USB Interrupt OUT, endpoint 0x04, 64-byte payload:
-//        bytes 0-3   : header  01 XX 02 03  (XX = a counter byte, value not
-//                      observed to matter functionally)
+//        bytes 0-3   : header  01 0C 02 03  (0C = five-zone static effect)
 //        bytes 4-15  : reserved / always 0x00
 //        bytes 16-18 : Zone 1 RGB
 //        bytes 20-22 : Zone 2 RGB
 //        bytes 24-26 : Zone 3 RGB
-//        bytes 28-35 : reserved slots (unused on this 5-zone SKU)
-//        bytes 36-38 : Zone 4 RGB
-//        bytes 40-42 : Zone 5 RGB
-//        bytes 43-63 : reserved / always 0x00
+//        bytes 28-30 : Zone 4 RGB
+//        bytes 32-34 : Zone 5 RGB
+//        bytes 35-63 : reserved / always 0x00
 //      (stride is 4 bytes per zone: R, G, B, 0x00 padding)
 //
 // UNVERIFIED / TODO before relying on this in production:
@@ -60,28 +58,36 @@ export function LedPositions() { return vLedPositions; }
 
 /* global
 shutdownColor:readonly
+lightingMode:readonly
 */
 export function ControllableParameters() {
   return [
+    { "property": "lightingMode", "label": "Lighting Mode", "type": "combobox", "values": ["Canvas", "Zone Test"], "default": "Canvas" },
     { "property": "shutdownColor", "label": "Shutdown Color", "min": "0", "max": "360", "type": "color", "default": "000000" },
   ];
 }
 
 // Byte offset (within the 64-byte data payload) of each zone's RGB triplet.
-const ZONE_OFFSETS = [16, 20, 24, 36, 40];
+const ZONE_OFFSETS = [16, 20, 24, 28, 32];
+const TEST_COLORS = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [255, 0, 255]];
+let lastRenderColors = null;
+let lastRenderTime = 0;
 
 export function Initialize() {
+  lastRenderColors = null;
+  lastRenderTime = 0;
   // One-time "enter custom/software lighting mode" command, inferred from
   // the first feature report seen in the capture (0x88, 0x01). Verify this
   // is actually required; some devices work fine without an explicit
   // "enter software mode" handshake.
   sendFeatureCommand(0x88, 0x01);
-  sendColors();
+  device.pause(100);
+  device.send_report([0x00, 0x19, 0x00, 0x5A, 0x0C, 0x00, 0x00, 0x00, 0x00], 9);
+  device.pause(100);
 }
 
 export function Render() {
-  sendFeatureCommand(0x14, 0x00);
-  sendColors();
+  sendColors(undefined, true);
   device.pause(50);
 }
 
@@ -102,13 +108,13 @@ function sendFeatureCommand(cmd0, cmd1) {
   device.send_report(packet, packet.length);
 }
 
-function sendColors(overrideColor) {
+function sendColors(overrideColor, skipUnchanged) {
   // Build the 64-byte lighting payload, then prepend the 0x00 report-id pad
   // byte for device.write() (matches SignalRGB's documented convention for
   // devices with no numbered reports on the write endpoint).
   let data = new Array(64).fill(0x00);
   data[0] = 0x01;
-  data[1] = 0x01; // counter byte — value not observed to matter
+  data[1] = 0x0C;
   data[2] = 0x02;
   data[3] = 0x03;
 
@@ -116,6 +122,8 @@ function sendColors(overrideColor) {
     let color;
     if (overrideColor) {
       color = hexToRgb(overrideColor);
+    } else if (typeof lightingMode !== "undefined" && lightingMode === "Zone Test") {
+      color = TEST_COLORS[i];
     } else {
       let [x, y] = vLedPositions[i];
       color = device.color(x, y);
@@ -124,6 +132,15 @@ function sendColors(overrideColor) {
     data[off] = color[0];
     data[off + 1] = color[1];
     data[off + 2] = color[2];
+  }
+
+  if (skipUnchanged) {
+    let colors = ZONE_OFFSETS.map(off => data.slice(off, off + 3).join(",")).join(",");
+    let now = Date.now();
+    if (colors === lastRenderColors && now - lastRenderTime < 2000) return;
+    sendFeatureCommand(0x14, 0x00);
+    lastRenderColors = colors;
+    lastRenderTime = now;
   }
 
   let packet = [0x00].concat(data); // leading report-id pad byte
